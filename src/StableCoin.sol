@@ -4,21 +4,30 @@ pragma solidity ^0.8.18;
 import {ERC20} from "../src/ERC20.sol";
 import {DepositorCoin} from "../src/DepositorCoin.sol";
 import {Oracle} from "../src/Oracle.sol";
+import {FixedPoint, fromFraction, mulFixedPoint, divFixedPoint} from "./FixedPoint.sol"; 
 
 contract StableCoin is ERC20 {
     DepositorCoin public depositorCoin;
     Oracle public oracle; 
     uint256 public feeRatePercentage; 
+    uint256 public initialCollateralRatioPercentage;
+    uint256 public depositorCoinLockTime; 
+
+    error InitialCollateralRatioError(string message, uint256 minimumDepositAmount); 
 
     constructor(
         string memory _name,
         string memory _symbol,
         uint256 _decimals,
         Oracle _oracle, 
-        uint256 _feeRatePercentage
+        uint256 _feeRatePercentage, 
+        uint256 _initialCollateralRatioPercentage, 
+        uint256 _depositorCoinLockTime
     ) ERC20(_name, _symbol, _decimals) {
         oracle = _oracle;
         feeRatePercentage = _feeRatePercentage; 
+        initialCollateralRatioPercentage = _initialCollateralRatioPercentage;
+        depositorCoinLockTime = _depositorCoinLockTime;
 
     }
 
@@ -47,26 +56,46 @@ contract StableCoin is ERC20 {
     function depositCollateralBuffer() external payable {
         int256 deficitOrSurplusInUsd = _getDeficitOrSurplusInContractInUsd();
 
-        uint256 usdInDpcPrice; 
-        uint256 addedSurplusEth; 
-
         if (deficitOrSurplusInUsd <= 0) {
             uint256 deficitInUsd = uint256(deficitOrSurplusInUsd * -1);
             uint256 deficitInEth = deficitInUsd / oracle.getPrice();
             
-            addedSurplusEth = msg.value - deficitInEth; 
+            uint256 addedSurplusEth = msg.value - deficitInEth; 
 
-            depositorCoin = new DepositorCoin("Depositor Coin", "DPC"); 
-            // new surplus: msg.value * oracle.getPrice();
+            uint256 requiredInitialSurplusInUsd = (initialCollateralRatioPercentage * totalSupply) / 100; 
 
-            usdInDpcPrice = 1; 
-        } else {
-            usdInDpcPrice = depositorCoin.totalSupply() / deficitOrSurplusInUsd;
-            addedSurplusEth = msg.value; 
-        }
+            uint256 requiredInitialSurplusInEth = requiredInitialSurplusInUsd / oracle.getPrice();
+
+            // require(addedSurplusEth >= requiredInitialSurplusInEth, "STC: Initial collateral ratio not met");
+
+            if (addedSurplusEth < requiredInitialSurplusInEth) {
+                uint minimumDeposit = deficitInEth + requiredInitialSurplusInEth;
+                revert InitialCollateralRatioError("STC: Initial collateral ratio not met, minimum is", minimumDeposit); 
         
+            }
+            
+            uint256 initialDepositorSupply = addedSurplusEth * oracle.getPrice();
+ 
+            depositorCoin = new DepositorCoin(
+                "Depositor Coin", 
+                "DPC", 
+                depositorCoinLockTime, 
+                msg.sender, 
+                initialDepositorSupply
+                
+                ); 
+            // new surplus: (msg.value - deficitInEth) * oracle.getPrice();
 
-        uint256 mintDepositorCoinAmount = addedSurplusEth * oracle.getPrice() * usdInDpcPrice;
+            return;
+        }
+
+        uint256 surplusInUsd = uint256(deficitOrSurplusInUsd);
+
+        // usdInDpcPrice = 250 / 500 = 0.5 e18
+        FixedPoint usdInDpcPrice = fromFraction(depositorCoin.totalSupply(), surplusInUsd);
+        
+        // 0.5e18 * 1000 * 0.5e18 = 250e36
+        uint256 mintDepositorCoinAmount = mulFixedPoint(msg.value * oracle.getPrice(),  usdInDpcPrice);
         depositorCoin.mint(msg.sender, mintDepositorCoinAmount);
     }
 
@@ -79,10 +108,10 @@ contract StableCoin is ERC20 {
         depositorCoin.burn(msg.sender, burnDepositorCoinAmount); 
 
         // usdInDpcPrice = 250 / 500 = 0.5 
-        uint256 usdInDpcPrice = depositorCoin.totalSupply() / deficitOrSurplusInUsd; 
+        FixedPoint usdInDpcPrice = fromFraction(depositorCoin.totalSupply(), surplusInUsd); 
       
         // 125 / 0.5 = 250 
-        uint256 refundingUsd = burnDepositorCoinAmount / usdInDpcPrice; 
+        uint256 refundingUsd = divFixedPoint(burnDepositorCoinAmount, usdInDpcPrice); 
         
         // 250 / 1000 = 0.25 ETH 
         uint256 refundingEth = refundingUsd / oracle.getPrice(); 
